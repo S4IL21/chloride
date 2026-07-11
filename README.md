@@ -1,11 +1,11 @@
-# coral
+# chloride
 
-Coral is a deep AI agent, with a Discord integration.
+Chloride is a deep AI agent, with a Discord integration.
 
 ## Installation
 
 ```
-$ gh repo clone uukelele/coral
+$ gh repo clone S4IL21/chloride
 $ cd coral
 $ pip install -e . -U
 ```
