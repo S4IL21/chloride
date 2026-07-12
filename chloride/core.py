@@ -4,7 +4,7 @@ import os
 import typer
 
 from .config import load_config
-from .bot import CoralBot
+from .bot import ChlorideBot
 from .history import init_db
 from .agent import agent
 
@@ -20,15 +20,12 @@ def main():
             config.AI_MODEL_NAME,
             provider = OpenAIProvider(
                 base_url = config.AI_OPENAI_COMPATIBLE_BASE_URL,
-                api_key  = config.AI_API_KEY or os.getenv('AI_API_KEY') or 'X', # some APIs are keyless
+                api_key = config.AI_API_KEY or os.getenv('AI_API_KEY') or 'X',
             ),
             settings = config.AI_EXTRA_CONFIG,
         )
     else:
         model = config.AI_MODEL_NAME
-        # google-gla:gemini-flash-latest -> GOOGLE_API_KEY
-        # xai:grok-4-1-fast-non-reasoning -> XAI_API_KEY
-        # openai:gpt-5.2 -> OPENAI_API_KEY
 
         os.environ[model.split(':')[0].split('-')[0].upper() + '_API_KEY'] = config.AI_API_KEY
 
@@ -36,12 +33,12 @@ def main():
 
     intents = discord.Intents.all()
 
-    client = CoralBot(
-        config  = config,
-        agent   = agent,
-        model   = model,
+    client = ChlorideBot(
+        config = config,
+        agent = agent,
+        model = model,
         intents = intents,
-        engine  = engine,
+        engine = engine,
     )
 
     token = config.DISCORD_TOKEN or os.getenv('DISCORD_TOKEN')

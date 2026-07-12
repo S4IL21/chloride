@@ -28,43 +28,50 @@ class Deps:
     config: libcfg.Config = None
     is_summary: bool = False
     is_message: bool = True
-    # The resolved permission tier of the user who triggered this run.
-    # `None` means tiers are not configured (legacy mode) and all tools are allowed.
     tier: Optional[libcfg.Tier] = None
+    is_admin: bool = False
 
 async def restrict_tools_by_tier(ctx: RunContext[Deps], tool_def: ToolDefinition):
-    """
-    Per-run tool gate. When a tier is set on the deps, only tools permitted by that
-    tier's `allowed_tools` are exposed to the model. `"*"` allows everything, an
-    empty list allows nothing. When no tier is set (legacy mode), all tools remain
-    available for backward compatibility.
-    """
     tier = getattr(ctx.deps, 'tier', None)
     if tier is None:
         return tool_def
     return tool_def if tier.can_use_tool(tool_def.name) else None
 
+async def always_allow(ctx: RunContext[Deps], tool_def: ToolDefinition):
+    return tool_def
+
 _ddg_tool = duckduckgo_search_tool()
-_ddg_tool.prepare = restrict_tools_by_tier
+_ddg_tool.prepare = always_allow
 
 agent = Agent(
     deps_type = Deps,
     tools=[_ddg_tool]
 )
 
-# Delivered as instructions (not a system_prompt) so it is re-injected on every
-# run. A system_prompt is baked into the stored message history only once and is
-# NOT regenerated when message_history is passed, which means it (and the included
-# config.md.j2) gets lost as soon as the conversation is summarized and old history
-# records are pruned. Instructions are always regenerated and never persisted.
+class JudgeVerdict(BaseModel):
+    safe: bool
+    reason: str = ''
+
+judge_agent = Agent(
+    output_type = JudgeVerdict,
+)
+
+async def judge_output(model: Model | str, user_message: str, bot_reply: str) -> JudgeVerdict:
+    from . import safety
+    result = await judge_agent.run(
+        user_prompt = safety.build_judge_prompt(user_message, bot_reply),
+        model = model,
+    )
+    return result.output
+
 @agent.instructions
 def system_prompt(ctx: RunContext[Deps]):
     if ctx.deps.is_summary:
         return prompts.SUMMARIZATION_PROMPT
     
     if ctx.deps.client and ctx.deps.config:
-        return prompts.SYSTEM_PROMPT.render(client=ctx.deps.client, config=ctx.deps.config)
-    
+        return prompts.SYSTEM_PROMPT.render(client=ctx.deps.client, config=ctx.deps.config, is_admin=ctx.deps.is_admin)
+
     return ''
 
 @agent.instructions
@@ -223,32 +230,8 @@ class SearchResponse(BaseModel):
 async def search_discord(
     ctx: RunContext[Deps],
     search_params: SearchParams
-): # -> SearchResponse:
-    """
-    Search through the entire Discord guild to find certain messages.
-
-    Use this when, for example, a user asks to find the first message sent by a user, in a specific channel, or in the entire server, or containing a specific phrase.
-
-    Param Names
-    - Author ID:
-      - The author of the user who sent the method. Leave empty to not check any authors.
-    - Mentions:
-      - The ID of the user who the message should mention. Leave empty to not check the message mentions.
-    - Has:
-      - Filter only messages which have a certain thing.
-    - Channel ID:
-      - The ID of the channel to search for. Self-explanatory. Like the others, leave this empty to not filter out any channels.
-    - Pinned:
-      - Set this to True to only include pinned messages in the results.
-    - Sort By:
-      - There is only one available option here, that is `timestamp`. I don't know why I even made this an option.
-    - Sort Order:
-      - Descending or Ascending. Self-explanatory.
-    - Offset:
-      - If you want to view page 2, page 3, of results until you find what you are looking for, you can use this. Because each search request returns the total result count as well as the first 20 after your offset.
-    """
+):
     try:
-        # return SearchResponse.model_validate(await ctx.deps.client.http.request(
         return await ctx.deps.client.http.request(
             discord.http.Route(
                 method = 'GET',
@@ -260,21 +243,112 @@ async def search_discord(
         return {"error": str(e)}
 
 @agent.tool(prepare=restrict_tools_by_tier)
-def get_user_info(ctx: RunContext[Deps]) -> Union[Member, User]:
-    """Get the information of the user who sent the message."""
-    author = ctx.deps.message.author
-    if isinstance(author, discord.Member):
-        return Member.model_validate(author)
-    
-    return User.model_validate(author)
+async def get_user_info(ctx: RunContext[Deps], user_id: Optional[str] = None) -> Union[Member, User, dict]:
+    if user_id is None:
+        target = ctx.deps.message.author
+        if isinstance(target, discord.Member):
+            return Member.model_validate(target)
+        return User.model_validate(target)
+
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return {'error': f'Invalid user id: {user_id!r}'}
+
+    guild = getattr(ctx.deps.message, 'guild', None)
+    if guild is not None:
+        member = guild.get_member(uid)
+        if member is None:
+            try:
+                member = await guild.fetch_member(uid)
+            except discord.HTTPException:
+                member = None
+        if member is not None:
+            return Member.model_validate(member)
+
+    try:
+        user = ctx.deps.client.get_user(uid) or await ctx.deps.client.fetch_user(uid)
+    except discord.HTTPException as e:
+        return {'error': f'Could not find a user with id {uid}: {e}'}
+
+    return User.model_validate(user)
+
+class ConfirmView(discord.ui.View):
+    def __init__(self, allowed_ids: set[int], timeout: float = 120):
+        super().__init__(timeout=timeout)
+        self.allowed_ids = allowed_ids
+        self.value = None
+
+    async def _resolve_ids(self, interaction: discord.Interaction) -> set[int]:
+        ids = {interaction.user.id}
+        ids.update(role.id for role in getattr(interaction.user, 'roles', []))
+        return ids
+
+    @discord.ui.button(label='Approve', style=discord.ButtonStyle.danger)
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not (await self._resolve_ids(interaction)).intersection(self.allowed_ids):
+            await interaction.response.send_message("Only an admin can approve this.", ephemeral=True)
+            return
+        self.value = True
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="Approved.", view=self)
+        self.stop()
+
+    @discord.ui.button(label='Deny', style=discord.ButtonStyle.secondary)
+    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not (await self._resolve_ids(interaction)).intersection(self.allowed_ids):
+            await interaction.response.send_message("Only an admin can deny this.", ephemeral=True)
+            return
+        self.value = False
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="Denied.", view=self)
+        self.stop()
+
+async def _require_confirmation(ctx: RunContext[Deps], tool_name: str, preview: str) -> Optional[str]:
+    config = getattr(ctx.deps, 'config', None)
+    if config is None or not config.CONFIRM_DANGEROUS_TOOLS:
+        return None
+    if tool_name not in (config.CONFIRM_TOOLS or []):
+        return None
+    if getattr(ctx.deps, 'is_admin', False):
+        return None
+    if ctx.deps.message is None:
+        return 'Execution blocked: dangerous tools require admin confirmation, which is unavailable here.'
+
+    allowed_ids = set(config.ADMIN_ROLE_OR_USER_IDS or [])
+    if not allowed_ids:
+        return 'Execution blocked: no admins are configured to approve dangerous tools.'
+
+    snippet = preview if len(preview) <= 500 else preview[:500] + '...'
+    embed = discord.Embed(
+        title=f"Approval required: {tool_name}",
+        description=f"Requested by {ctx.deps.message.author.mention}.\n```\n{snippet}\n```",
+        timestamp=datetime.now(),
+    )
+    view = ConfirmView(allowed_ids)
+    prompt_msg = await ctx.deps.message.channel.send(embed=embed, view=view)
+    await view.wait()
+
+    try:
+        if view.value is None:
+            await prompt_msg.edit(content="Approval timed out.", view=None)
+    except discord.HTTPException:
+        pass
+
+    if view.value is True:
+        return None
+    if view.value is False:
+        return 'An admin denied this action.'
+    return 'The approval request timed out; the action was not run.'
 
 @agent.tool(prepare=restrict_tools_by_tier)
 async def run_shell(ctx: RunContext[Deps], command: str, timeout: int = 10) -> str:
-    """
-    This tool allows you to run shell commands on the system.
+    denial = await _require_confirmation(ctx, 'run_shell', command)
+    if denial is not None:
+        return {'error': denial}
 
-    Use this to install Python packages, navigate the filesystem, or download files.
-    """
     print(f"Agent running shell command: {command}")
 
     try:
@@ -294,31 +368,10 @@ async def run_shell(ctx: RunContext[Deps], command: str, timeout: int = 10) -> s
 
 @agent.tool(prepare=restrict_tools_by_tier)
 async def run_code(ctx: RunContext[Deps], code: str, timeout: int = 10):
-    """
-    This tool allows you to run Python code on the system.
+    denial = await _require_confirmation(ctx, 'run_code', code)
+    if denial is not None:
+        return {'error': denial}
 
-    You have the following variables available to you:
-
-    `message` - contains a `discord.Message` object of the current message, if necessary.
-    `discord` - the `discord` library.
-    `client`  - the `discord.Client` which you are running on.
-    - All other builtins.
-
-    You are allowed to use `async`/`await` keywords.
-
-    Timeout is how long to wait for the function to run, in seconds.
-
-    When writing code, always begin with `async def main(message, discord, client):` so that you have access to the `discord.Message` and `discord` and `discord.Client` objects.
-
-    Inside your function, you can `return` with anything you want to send back to yourself, the AI agent.
-    
-    Whatever you return MUST be JSON-serializable (or a Pydantic object). If it is not, attempt to serialize it yourself first by e.g. writing a wrapper dictionary.
-
-    If there is an error, provide error details to the user.
-
-    If you need a 3rd party package, you can use `run_shell` to install it before running the code. For this, set the timeout to something higher e.g. 120.
-    """
-    
     warnings = []
 
     if not code.strip().startswith('async def main(message, discord, client):') or not 'async def main(message, discord, client):' in code:
@@ -329,7 +382,7 @@ async def main(message, discord, client):
 {indent(code, 4)}
         """
 
-    locals  = {}
+    locals = {}
     globals = { '__builtins__': __builtins__ }
 
     stdout_buffer = StringIO()
@@ -374,25 +427,6 @@ class FileType(str, Enum):
 
 @agent.tool(prepare=restrict_tools_by_tier)
 async def analyse_file(ctx: RunContext[Deps], url: str, file_type: FileType, query: Optional[str] = None) -> str:
-    """
-    This tool analyses a file.
-    Supported file types are dependent on the model, so some models may not support every single input type.
-    However, here are all the possible accepted types:
-
-    - image
-    - audio
-    - video
-    - document (pdf, docs, etc.)
-
-    The url is the path to the file. It can either be a HTTP(S) URL to the file (useful for e.g. Discord CDN links), or
-    an absolute / relative file path.
-
-    The query is the query to give the summarization model.
-
-    If there is no query given, you will receive a summary of the file.
-    If you have a specific query, you will receive a brief summary as well as an answer to the query, e.g. "What colour is the man's shirt?".
-    """
-
     if url.startswith('http'):
         match file_type:
             case FileType.IMAGE:
@@ -425,21 +459,236 @@ async def analyse_file(ctx: RunContext[Deps], url: str, file_type: FileType, que
         return f"There was an unknown error during the operation. {e}"
     
 @agent.tool(prepare=restrict_tools_by_tier)
+async def get_channel_info(ctx: RunContext[Deps], channel_id: Optional[str] = None) -> dict:
+    guild = getattr(ctx.deps.message, 'guild', None)
+    if channel_id is None:
+        channel = ctx.deps.message.channel
+    else:
+        try:
+            cid = int(channel_id)
+        except (TypeError, ValueError):
+            return {'error': f'Invalid channel id: {channel_id!r}'}
+        channel = ctx.deps.client.get_channel(cid)
+        if channel is None:
+            try:
+                channel = await ctx.deps.client.fetch_channel(cid)
+            except discord.HTTPException as e:
+                return {'error': f'Could not find channel {cid}: {e}'}
+
+    return {
+        'id': channel.id,
+        'name': getattr(channel, 'name', None),
+        'type': str(getattr(channel, 'type', 'unknown')),
+        'topic': getattr(channel, 'topic', None),
+        'nsfw': getattr(channel, 'nsfw', None),
+        'category': getattr(getattr(channel, 'category', None), 'name', None),
+        'position': getattr(channel, 'position', None),
+        'guild_id': getattr(guild, 'id', None),
+    }
+
+@agent.tool(prepare=restrict_tools_by_tier)
+async def get_server_info(ctx: RunContext[Deps]) -> dict:
+    guild = getattr(ctx.deps.message, 'guild', None)
+    if guild is None:
+        return {'error': 'This message is not in a server.'}
+
+    return {
+        'id': guild.id,
+        'name': guild.name,
+        'description': guild.description,
+        'member_count': guild.member_count,
+        'owner_id': guild.owner_id,
+        'created_at': guild.created_at.isoformat(),
+        'channel_count': len(guild.channels),
+        'role_count': len(guild.roles),
+        'roles': [role.name for role in guild.roles if role.name != '@everyone'],
+        'emoji_count': len(guild.emojis),
+        'boost_level': guild.premium_tier,
+        'boost_count': guild.premium_subscription_count,
+    }
+
+@agent.tool(prepare=restrict_tools_by_tier)
+async def read_channel_history(ctx: RunContext[Deps], limit: int = 20, channel_id: Optional[str] = None) -> Union[list, dict]:
+    limit = max(1, min(limit, 100))
+
+    if channel_id is None:
+        channel = ctx.deps.message.channel
+    else:
+        try:
+            cid = int(channel_id)
+        except (TypeError, ValueError):
+            return {'error': f'Invalid channel id: {channel_id!r}'}
+        channel = ctx.deps.client.get_channel(cid)
+        if channel is None:
+            try:
+                channel = await ctx.deps.client.fetch_channel(cid)
+            except discord.HTTPException as e:
+                return {'error': f'Could not find channel {cid}: {e}'}
+
+    try:
+        out = []
+        async for msg in channel.history(limit=limit):
+            out.append({
+                'id': msg.id,
+                'author': msg.author.display_name,
+                'author_id': msg.author.id,
+                'content': msg.content,
+                'created_at': msg.created_at.isoformat(),
+            })
+        return out
+    except discord.HTTPException as e:
+        return {'error': str(e)}
+
+@agent.tool(prepare=restrict_tools_by_tier)
+async def get_time(ctx: RunContext[Deps]) -> str:
+    return datetime.now().isoformat()
+
+@agent.tool(prepare=restrict_tools_by_tier)
+async def set_reminder(ctx: RunContext[Deps], duration: str, content: str, repeat: bool = False) -> dict:
+    from .utils import parse_duration
+    seconds = parse_duration(duration)
+    if seconds <= 0:
+        return {'error': f'Could not understand the duration {duration!r}. Try something like "10m" or "1h30m".'}
+
+    client = ctx.deps.client
+    if client is None or ctx.deps.message is None:
+        return {'error': 'Reminders can only be set from a channel message.'}
+
+    reminder_id = client.add_reminder(
+        channel_id = ctx.deps.message.channel.id,
+        user_id = ctx.deps.message.author.id,
+        guild_id = getattr(ctx.deps.message.guild, 'id', None),
+        content = content,
+        seconds = seconds,
+        repeat = repeat,
+    )
+    return {'ok': True, 'reminder_id': reminder_id, 'fires_in_seconds': seconds, 'repeat': repeat}
+
+@agent.tool(prepare=restrict_tools_by_tier)
+async def send_message(ctx: RunContext[Deps], content: str, channel_id: Optional[str] = None) -> dict:
+    if channel_id is None:
+        channel = ctx.deps.message.channel
+    else:
+        try:
+            cid = int(channel_id)
+        except (TypeError, ValueError):
+            return {'error': f'Invalid channel id: {channel_id!r}'}
+        channel = ctx.deps.client.get_channel(cid)
+        if channel is None:
+            try:
+                channel = await ctx.deps.client.fetch_channel(cid)
+            except discord.HTTPException as e:
+                return {'error': f'Could not find channel {cid}: {e}'}
+
+    try:
+        sent = await channel.send(content, allowed_mentions=discord.AllowedMentions.none())
+        return {'sent': True, 'message_id': sent.id, 'channel_id': channel.id}
+    except discord.HTTPException as e:
+        return {'error': str(e)}
+
+@agent.tool(prepare=restrict_tools_by_tier)
+async def set_channel_topic(ctx: RunContext[Deps], topic: str, channel_id: Optional[str] = None) -> dict:
+    channel = ctx.deps.message.channel if channel_id is None else ctx.deps.client.get_channel(int(channel_id))
+    if channel is None:
+        return {'error': f'Could not find channel {channel_id}.'}
+    try:
+        await channel.edit(topic=topic)
+        return {'ok': True, 'channel_id': channel.id, 'topic': topic}
+    except discord.HTTPException as e:
+        return {'error': str(e)}
+
+async def _resolve_member(ctx: RunContext[Deps], user_id: str):
+    guild = getattr(ctx.deps.message, 'guild', None)
+    if guild is None:
+        return None, {'error': 'This action requires a server.'}
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return None, {'error': f'Invalid user id: {user_id!r}'}
+    member = guild.get_member(uid)
+    if member is None:
+        try:
+            member = await guild.fetch_member(uid)
+        except discord.HTTPException as e:
+            return None, {'error': f'Could not find member {uid}: {e}'}
+    return member, None
+
+@agent.tool(prepare=restrict_tools_by_tier)
+async def purge_messages(ctx: RunContext[Deps], limit: int = 10, channel_id: Optional[str] = None) -> dict:
+    limit = max(1, min(limit, 100))
+    channel = ctx.deps.message.channel if channel_id is None else ctx.deps.client.get_channel(int(channel_id))
+    if channel is None:
+        return {'error': f'Could not find channel {channel_id}.'}
+    try:
+        deleted = await channel.purge(limit=limit)
+        return {'deleted': len(deleted), 'channel_id': channel.id}
+    except discord.HTTPException as e:
+        return {'error': str(e)}
+
+@agent.tool(prepare=restrict_tools_by_tier)
+async def kick_member(ctx: RunContext[Deps], user_id: str, reason: Optional[str] = None) -> dict:
+    member, err = await _resolve_member(ctx, user_id)
+    if err:
+        return err
+    try:
+        await member.kick(reason=reason)
+        return {'kicked': member.id}
+    except discord.HTTPException as e:
+        return {'error': str(e)}
+
+@agent.tool(prepare=restrict_tools_by_tier)
+async def ban_member(ctx: RunContext[Deps], user_id: str, reason: Optional[str] = None, delete_message_days: int = 0) -> dict:
+    member, err = await _resolve_member(ctx, user_id)
+    if err:
+        return err
+    try:
+        await member.ban(reason=reason, delete_message_days=max(0, min(delete_message_days, 7)))
+        return {'banned': member.id}
+    except discord.HTTPException as e:
+        return {'error': str(e)}
+
+@agent.tool(prepare=restrict_tools_by_tier)
+async def timeout_member(ctx: RunContext[Deps], user_id: str, minutes: int, reason: Optional[str] = None) -> dict:
+    from datetime import timedelta
+    member, err = await _resolve_member(ctx, user_id)
+    if err:
+        return err
+    try:
+        await member.timeout(timedelta(minutes=max(1, minutes)), reason=reason)
+        return {'timed_out': member.id, 'minutes': minutes}
+    except discord.HTTPException as e:
+        return {'error': str(e)}
+
+@agent.tool(prepare=restrict_tools_by_tier)
+async def add_role(ctx: RunContext[Deps], user_id: str, role_id: str, reason: Optional[str] = None) -> dict:
+    member, err = await _resolve_member(ctx, user_id)
+    if err:
+        return err
+    role = member.guild.get_role(int(role_id))
+    if role is None:
+        return {'error': f'Could not find role {role_id}.'}
+    try:
+        await member.add_roles(role, reason=reason)
+        return {'added_role': role.id, 'to': member.id}
+    except discord.HTTPException as e:
+        return {'error': str(e)}
+
+@agent.tool(prepare=restrict_tools_by_tier)
+async def remove_role(ctx: RunContext[Deps], user_id: str, role_id: str, reason: Optional[str] = None) -> dict:
+    member, err = await _resolve_member(ctx, user_id)
+    if err:
+        return err
+    role = member.guild.get_role(int(role_id))
+    if role is None:
+        return {'error': f'Could not find role {role_id}.'}
+    try:
+        await member.remove_roles(role, reason=reason)
+        return {'removed_role': role.id, 'from': member.id}
+    except discord.HTTPException as e:
+        return {'error': str(e)}
+
+@agent.tool(prepare=restrict_tools_by_tier)
 async def trigger_reboot(ctx: RunContext[Deps]):
-    """
-    Triggers a reboot of the container you are running in.
-
-    WARNING: Only use this as a last resort, when you really have to.
-
-    When this tool is ran, a message will be sent in the current channel saying that you are restarting.
-
-    You will not be able to see the result of this response, as you will be shutdown.
-
-    When you (automatically) restart, you will not be active until being triggered by another message from a user.
-
-    You can use this tool for things like e.g. when you modify your configuration and want to restart.
-    """
-
     if ctx.deps.message:
         await ctx.deps.message.channel.send(embed = discord.Embed(
             title = "Rebooting...",

@@ -1,38 +1,70 @@
 def chunk_string(s: str, size: int = 2000):
     return [s[i:i+size] for i in range(0, len(s), size)]
 
+import re as _dre
+
+_DURATION_RE = _dre.compile(r'(\d+)\s*(w|week|weeks|d|day|days|h|hr|hour|hours|m|min|mins|minute|minutes|s|sec|secs|second|seconds)', _dre.IGNORECASE)
+
+_DURATION_UNITS = {
+    'w': 604800, 'week': 604800, 'weeks': 604800,
+    'd': 86400, 'day': 86400, 'days': 86400,
+    'h': 3600, 'hr': 3600, 'hour': 3600, 'hours': 3600,
+    'm': 60, 'min': 60, 'mins': 60, 'minute': 60, 'minutes': 60,
+    's': 1, 'sec': 1, 'secs': 1, 'second': 1, 'seconds': 1,
+}
+
+def parse_duration(text: str) -> int:
+    total = 0
+    for amount, unit in _DURATION_RE.findall(text or ''):
+        total += int(amount) * _DURATION_UNITS[unit.lower()]
+    return total
+
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+_CLOCK_RE = _dre.compile(r'^\s*(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*$', _dre.IGNORECASE)
+
+def seconds_until(text: str, now_utc: datetime, tz_name: str = 'UTC') -> int:
+    relative = parse_duration(text)
+    if relative > 0:
+        return relative
+
+    match = _CLOCK_RE.match(text or '')
+    if not match:
+        return 0
+
+    hour = int(match.group(1))
+    minute = int(match.group(2) or 0)
+    meridiem = (match.group(3) or '').lower()
+    if meridiem == 'pm' and hour < 12:
+        hour += 12
+    elif meridiem == 'am' and hour == 12:
+        hour = 0
+    if hour > 23 or minute > 59:
+        return 0
+
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo('UTC')
+
+    local_now = now_utc.astimezone(tz)
+    target = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= local_now:
+        target += timedelta(days=1)
+
+    return int((target - local_now).total_seconds())
+
 import re as _re
 
 _MASS_MENTION_RE = _re.compile(r'@(everyone|here)')
 
 def neutralize_mass_mentions(text: str) -> str:
-    """
-    Hard-strip `@everyone` / `@here` mass mentions from outgoing text by removing
-    the leading `@`, turning them into the harmless words `everyone` / `here`.
-    """
     return _MASS_MENTION_RE.sub(r'\1', text)
 
 _ROLE_MENTION_RE = _re.compile(r'<@&([0-9]{15,20})>')
 
 def sanitize_role_mentions(text: str, guild, channel, member, allow_everyone: bool = False):
-    """
-    For each role mention (`<@&id>`) in outgoing text, keep it as a real ping only
-    if `member` (the user who triggered the bot) is actually allowed to ping that
-    role in `channel`; otherwise replace it with the plain-text role name (e.g.
-    `<@&1088558118113378434>` -> `@Member`).
-
-    The `@everyone` role shares its id with the guild id, so `<@&guild_id>` is a
-    mass mention in disguise; it is governed by `allow_everyone` (and stripped to
-    plain `everyone` when not allowed) rather than the per-role logic.
-
-    A user may ping a normal role when the role is `mentionable`, or when the user
-    has the "Mention @everyone, @here, and All Roles" permission in that channel
-    (which Administrator implies).
-
-    Returns `(sanitized_text, allowed_role_objects)`. `allowed_role_objects` is the
-    list of roles that were kept as real pings, suitable for passing straight to
-    `discord.AllowedMentions(roles=...)` as a hard, API-level safety net.
-    """
     if guild is None or member is None:
         return text, []
 
@@ -47,12 +79,8 @@ def sanitize_role_mentions(text: str, guild, channel, member, allow_everyone: bo
         rid = int(match.group(1))
         role = guild.get_role(rid)
         if role is None:
-            # Unknown/deleted role won't ping anyone real; leave untouched.
             return match.group(0)
 
-        # The @everyone role is a mass mention; never let it fall through to the
-        # `@{name}` path (its name is literally "@everyone", which would recreate a
-        # live ping). It is controlled solely by `allow_everyone`.
         if rid == guild.id or getattr(role, 'is_default', lambda: False)():
             if allow_everyone:
                 return match.group(0)
@@ -78,15 +106,15 @@ def clean(message: discord.Message):
     if message.guild:
 
         def resolve_member(id: int) -> str:
-            m = message.guild.get_member(id) or discord.utils.get(message.mentions, id=id)  # type: ignore
+            m = message.guild.get_member(id) or discord.utils.get(message.mentions, id=id)
             return f'@{m.display_name}' if m else '@deleted-user'
 
         def resolve_role(id: int) -> str:
-            r = message.guild.get_role(id) or discord.utils.get(message.role_mentions, id=id)  # type: ignore
+            r = message.guild.get_role(id) or discord.utils.get(message.role_mentions, id=id)
             return f'@{r.name}' if r else '@deleted-role'
 
         def resolve_channel(id: int) -> str:
-            c = message.guild._resolve_channel(id)  # type: ignore
+            c = message.guild._resolve_channel(id)
             return f'#{c.name}' if c else '#deleted-channel'
 
     else:
