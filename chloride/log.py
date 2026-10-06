@@ -42,7 +42,7 @@ def _fmt(record: logging.LogRecord) -> str:
 
 
 # https://github.com/fastapi/typer/issues/203#issuecomment-840690307
-class CoralLogHandler(logging.Handler):
+class ChlorideLogHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
 
         text = _fmt(record)
@@ -83,7 +83,7 @@ def setup(verbose: bool = True):
     logger.setLevel(logging.DEBUG)
     logger.handlers.clear()
 
-    term_handler = CoralLogHandler()
+    term_handler = ChlorideLogHandler()
     term_handler.setLevel(logging.DEBUG if verbose else logging.INFO)
     logger.addHandler(term_handler)
 

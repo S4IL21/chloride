@@ -15,20 +15,25 @@ from pathlib import Path
 from . import moderation, utils
 
 if typing.TYPE_CHECKING:
-    from .bot import CoralBot
+    from .bot import ChlorideBot
 
 logger = logging.getLogger(__name__)
 
 REMINDERS_DB = 'sqlite:////workspace/reminders.db'
 
-_bot: 'CoralBot' = None
+_bot: 'ChlorideBot' = None
 
-async def fire_automation(name: str, bot: 'CoralBot', action: Literal['code', 'prompt'], payload: str, channel_id: Optional[int], author_id: int, guild_id: Optional[int], event_args: tuple):
+async def fire_automation(name: str, bot: 'ChlorideBot', action: Literal['code', 'prompt'], payload: str, channel_id: Optional[int], author_id: int, guild_id: Optional[int], event_args: tuple):
     if moderation.is_blocked(bot.engine, author_id)[0]: return
 
     channel = bot.get_channel(channel_id) if channel_id else None
     guild   = bot.get_guild(guild_id) if guild_id else None
-    member  = guild.get_member(author_id) if guild else None
+    member  = guild.get_member(author_id) if guild else bot.get_user(author_id)
+    if member is None and guild is None:
+        try:
+            member = await bot.fetch_user(author_id)
+        except Exception:
+            member = None
 
     match action:
         case 'prompt':
@@ -104,15 +109,21 @@ class Scheduler:
         )
         return job.id
 
-    def cancel(self, reminder_id: str) -> bool:
+    def cancel(self, reminder_id: str, author_id: Optional[int] = None) -> bool:
         try:
+            job = self.scheduler.get_job(reminder_id)
+            if job is None or (author_id is not None and job.args[4] != author_id):
+                return False
             self.scheduler.remove_job(reminder_id)
             return True
         except JobLookupError:
             return False
 
-    def list_all(self) -> list[dict]:
-        jobs: list[Job] = self.scheduler.get_jobs()
+    def list_all(self, author_id: Optional[int] = None) -> list[dict]:
+        jobs: list[Job] = [
+            job for job in self.scheduler.get_jobs()
+            if author_id is None or job.args[4] == author_id
+        ]
         return [
             {
                 'id': j.id,

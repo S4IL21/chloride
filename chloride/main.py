@@ -26,88 +26,70 @@ def main(
     log.setup(not quiet)
 
 @app.command(name='create-docker')
-def create_dockerfiles(path: Path = typer.Argument(Path('.')), force=False):
+def create_dockerfiles(
+    path: Path = typer.Argument(Path('.')),
+    force: bool = typer.Option(False, '--force', help='Replace existing Docker files.'),
+):
     path = path.resolve()
-    if not (path / 'config.yaml').exists() and not force:
-        # typer.secho('`config.yaml` does not exist in this directory. Please run `coral create` first, or pass --force=True.', fg='yellow')
-        return
+    if not (path / 'config.yaml').is_file():
+        logger.error("%s does not contain config.yaml. Run `chloride create` first.", path)
+        raise typer.Exit(1)
 
     p_dockerfile = path / 'Dockerfile'
     p_compose    = path / 'docker-compose.yml'
 
-    if p_dockerfile.exists() and p_compose.exists() and not force:
-        # typer.secho('`Dockerfile` and `docker-compose.yml` already exist. Please remove them first first, or pass --force=True.', fg='yellow')
-        return
+    existing = [p.name for p in (p_dockerfile, p_compose) if p.exists()]
+    if existing and not force:
+        logger.error("Deployment files already exist: %s. Pass --force to replace them.", ', '.join(existing))
+        raise typer.Exit(1)
     
     repo = Path(__file__).resolve().parent.parent
     from_source = (repo / 'pyproject.toml').exists()
+    if not from_source:
+        logger.error("Docker generation currently requires a Chloride source checkout.")
+        raise typer.Exit(1)
 
-    dockerfile = """
-FROM python:3.13
+    dockerfile = """\
+FROM python:3.13-slim
 
 WORKDIR /workspace
-"""
-    if not from_source:
-        dockerfile += """
-RUN pip install git+https://github.com/uukelele/coral.git
-"""
-    else: "Coral is installed at runtime from a mounted volume. This is for easier development."
-
-    dockerfile += """
-CMD ["python", "-m", "coral.core"]
+CMD ["python", "-m", "chloride.core"]
 """
 
     compose = f"""
 services:
     bot:
         build: .
-        container_name: coral-{path.name.lower().replace(' ', '-')}
+        container_name: chloride-{path.name.lower().replace(' ', '-')}
         restart: unless-stopped
         volumes:
             - .:/workspace
 """
     
-    if from_source:
-        compose += f"""
-            - {repo}:/opt/coral:ro
+    compose += f"""
+            - {repo}:/opt/chloride:ro
         
-        command: /bin/sh -c "mkdir -p /tmp/coral && cp -au /opt/coral/. /tmp/coral && pip install /tmp/coral && python -m coral.core"
+        command: /bin/sh -c "mkdir -p /tmp/chloride && cp -au /opt/chloride/. /tmp/chloride && pip install /tmp/chloride && python -m chloride.core"
 """
-        
-    if not p_dockerfile.exists():
-        logger.debug("Writing %s...", "Dockerfile")
-        # typer.secho("[+] Writing Dockerfile...")
-        p_dockerfile.write_text(dockerfile)
 
-    if not p_compose.exists():
-        logger.debug("Writing %s...", "docker-compose.yml")
-        # typer.secho("[+] Writing docker-compose.yml...")
-        p_compose.write_text(compose)
+    logger.debug("Writing Docker deployment files...")
+    p_dockerfile.write_text(dockerfile)
+    p_compose.write_text(compose)
+    (path / '.dockerignore').write_text('*\n')
 
 
 
 @app.command()
 def create(path: Path = typer.Argument(Path('.'))):
     path = path.resolve()
-    if (
-        path.exists()
-        and
-        (
-            path.is_file()
-            or
-            path.is_dir() and not any(path.iterdir())
-        )
-    ):
+    if path.exists() and (not path.is_dir() or any(path.iterdir())):
         logger.error("Path %s must be an empty folder.", str(path))
-        # typer.secho(f"Path {path} must be an empty folder.", fg='red')
         raise typer.Exit(1)
     
     if not path.exists():
         logger.debug("Creating directory %s...", str(path))
         # typer.secho(f"[+] Creating directory {path}...", fg='green')
         path.mkdir(parents=True, exist_ok=True)
-
-    name = path.name
 
     base_config = Config(
         DISCORD_TOKEN  = "Paste your Discord token here.",
@@ -159,10 +141,13 @@ def create(path: Path = typer.Argument(Path('.'))):
 
     (path / 'config.yaml').write_text(config)
     (path / 'config.md.j2').write_text(DEFAULT_EXTRA_PROMPT.render(path=path))
+    (path / '.gitignore').write_text(
+        'config.yaml\n*.db\nMEMORY/\nservices/\ncapabilities/\nautomations/\n.pending\n'
+    )
 
-    create_dockerfiles(path)
+    create_dockerfiles(path, force=False)
 
-    logger.info(f"Success! All set up! Now go and customize your bot!")
+    logger.info("Success! All set up! Now go and customize your bot!")
 
 @app.command()
 def clear(path: Path = typer.Argument(Path('.'))):
@@ -175,7 +160,7 @@ def clear(path: Path = typer.Argument(Path('.'))):
     parsed = urlparse(config.DB_PATH)
 
     if parsed.scheme != 'sqlite':
-        logger.error('The database is not a SQLite .db file. Coral cannot find the database path to clear.')
+        logger.error('The database is not a SQLite .db file. Chloride cannot find the database path to clear.')
         raise typer.Exit(1)
 
     db_path: Path
@@ -190,8 +175,11 @@ def clear(path: Path = typer.Argument(Path('.'))):
     confirm = (input(f"Clear memory file at {db_path}? [y/N]: ").strip().lower() or 'n')[0] == 'y'
 
     if confirm:
-        db_path.unlink()
-        logger.info("Memory cleared successfully.")
+        if db_path.exists():
+            db_path.unlink()
+            logger.info("Memory cleared successfully.")
+        else:
+            logger.info("Memory file does not exist; nothing to clear.")
 
     reminders = path / 'reminders.db'
     if reminders.exists():
@@ -201,7 +189,11 @@ def clear(path: Path = typer.Argument(Path('.'))):
 
     if (path / 'docker-compose.yml').exists():
         logger.debug("Shutting down and removing container...")
-        sp.run(['docker', 'compose', 'down', '-v'])
+        try:
+            sp.run(['docker', 'compose', 'down', '-v'], check=True)
+        except (FileNotFoundError, sp.CalledProcessError) as exc:
+            logger.error("Could not stop the Docker workspace: %s", exc)
+            raise typer.Exit(1) from exc
         logger.info("Workspace cleared.")
 
 
@@ -209,16 +201,21 @@ def clear(path: Path = typer.Argument(Path('.'))):
 def run(path: Path = typer.Argument(Path('.'))):
     os.chdir(path.resolve())
 
-    create_dockerfiles(path)
+    docker_files = (path / 'Dockerfile', path / 'docker-compose.yml')
+    if not all(p.exists() for p in docker_files):
+        create_dockerfiles(path, force=False)
 
-    logger.info("Booting Coral...")
+    logger.info("Booting Chloride...")
     
     try:
-        sp.run(['docker', 'compose', 'up', '--build'])
+        sp.run(['docker', 'compose', 'up', '--build'], check=True)
     except KeyboardInterrupt:
         logger.error('\nStopping workspace...')
-        sp.run(["docker", "compose", "stop"])
+        sp.run(["docker", "compose", "stop"], check=False)
         logger.info("Stopped.")
+    except (FileNotFoundError, sp.CalledProcessError) as exc:
+        logger.error("Could not run the Docker workspace: %s", exc)
+        raise typer.Exit(1) from exc
 
     
 

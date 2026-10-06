@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 from pathlib import Path
 from typing import *
 import yaml, logging, re
@@ -50,12 +50,16 @@ def parse_limit(limit: str) -> tuple[int, int]:
     unit = match.group(2)
     if unit not in _UNITS:
         raise ValueError(f"Invalid rate limit unit: {unit!r} (expected one of s, m, h, d or their full names)")
+    if count <= 0 or multiplier <= 0:
+        raise ValueError("Rate limit count and period must be positive")
 
     return count, multiplier * _UNITS[unit]
 
 class Tier(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
     allowed_roles_or_user_ids: Optional[List[int]] = None
-    allowed_tools: List[str] = []
+    allowed_tools: List[str] = Field(default_factory=list)
     allow_chat: bool = True
     allow_ping_everyone: bool = False
     ratelimit: Optional[str] = '6/m'
@@ -85,6 +89,8 @@ class Tier(BaseModel):
 
 
 class Config(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
     DISCORD_TOKEN: Optional[str] = None
     DISCORD_PREFIX: str = '-- '
     TIERS: Optional[Dict[str, Tier]] = None
@@ -95,7 +101,7 @@ class Config(BaseModel):
     AI_OPENAI_COMPATIBLE_BASE_URL: Optional[str] = None
     AI_ANTHROPIC_COMPATIBLE_BASE_URL: Optional[str] = None
     AI_EXTRA_CONTEXT_PATH: str = 'config.md.j2'
-    AI_EXTRA_CONFIG: dict[str, Any] = {}
+    AI_EXTRA_CONFIG: dict[str, Any] = Field(default_factory=dict)
 
     DB_PATH: str = 'sqlite:///memory.db'
 
@@ -121,6 +127,15 @@ def load_config(path: str | Path = 'config.yaml') -> Config:
     path = Path(path)
 
     if not path.exists():
-        raise FileNotFoundError(f"'{path}' does not exist. Please created it and add the required fields. Quickstart: `coral create {path.parent}`")
+        raise FileNotFoundError(f"'{path}' does not exist. Please created it and add the required fields. Quickstart: `chloride create {path.parent}`")
 
-    return Config.model_validate(yaml.full_load(path.read_text()))
+    config = Config.model_validate(yaml.safe_load(path.read_text()))
+    if config.AI_EXTRA_CONTEXT_PATH:
+        root = path.resolve().parent
+        context_path = (root / config.AI_EXTRA_CONTEXT_PATH).resolve()
+        if root != context_path and root not in context_path.parents:
+            raise ValueError("AI_EXTRA_CONTEXT_PATH must stay inside the workspace")
+        if not context_path.is_file():
+            raise FileNotFoundError(f"Extra context file does not exist: {context_path}")
+
+    return config

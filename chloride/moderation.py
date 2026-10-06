@@ -46,6 +46,8 @@ def unban(engine: Engine, user_id: int) -> bool:
     return True
 
 def timeout(engine: Engine, user_id: int, seconds: int, reason: Optional[str] = None) -> Optional[datetime]: # expiry
+    if seconds <= 0:
+        raise ValueError("Timeout duration must be positive.")
     until = now() + timedelta(seconds=seconds)
     with Session(engine) as session:
         row = session.get(Moderation, user_id)

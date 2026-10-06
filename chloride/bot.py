@@ -24,7 +24,7 @@ class ActiveRun(TypedDict):
     message: discord.Message
     owner_id: int
 
-class CoralBot(discord.Client):
+class ChlorideBot(discord.Client):
     def __init__(self, config: Config, agent: Agent, model: Model | str, engine: Engine, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -46,15 +46,23 @@ class CoralBot(discord.Client):
         self.scheduler = reminders.Scheduler(self)
 
         self.ev_automations: dict[str, list[dict]] = {}
+        self._running_automations: set[str] = set()
         self.supervisor = services.ServiceSupervisor(self)
 
         self.tree = discord.app_commands.CommandTree(self)
 
         @self.tree.context_menu(name="Ask Me")
         async def ask_me(interaction: discord.Interaction, message: discord.Message):
-
+            blocked, reason = moderation.is_blocked(self.engine, interaction.user.id)
+            if blocked:
+                await interaction.response.send_message(reason, ephemeral=True)
+                return
             allowed, tier = self._may_chat(interaction.user)
             if not allowed:
+                await interaction.response.send_message("You can't do that!", ephemeral=True)
+                return
+            if self._rate_limited(interaction.user.id, tier):
+                await interaction.response.send_message("You are being rate limited. Try again shortly.", ephemeral=True)
                 return
 
             await interaction.response.defer(thinking=True, ephemeral=True)
@@ -165,7 +173,19 @@ class CoralBot(discord.Client):
     def dispatch(self, event, /, *args, **kwargs):
         super().dispatch(event, *args, **kwargs)
         for auto in self.ev_automations.get(event, []):
-            self.loop.create_task(reminders.fire_automation(auto['name'], self, auto['action'], auto['payload'], auto['channel_id'], auto['author_id'], auto['guild_id'], event_args=args))
+            if auto['name'] not in self._running_automations:
+                self.loop.create_task(self._run_event_automation(auto, args))
+
+    async def _run_event_automation(self, auto: dict, event_args: tuple):
+        name = auto['name']
+        self._running_automations.add(name)
+        try:
+            await reminders.fire_automation(
+                name, self, auto['action'], auto['payload'], auto['channel_id'],
+                auto['author_id'], auto['guild_id'], event_args=event_args,
+            )
+        finally:
+            self._running_automations.discard(name)
 
     def register_event_automation(self, row: dict) -> bool:
         if any(a['name'] == row['name'] for autos in self.ev_automations.values() for a in autos): return False
@@ -187,17 +207,20 @@ class CoralBot(discord.Client):
         self.ev_automations.setdefault(row['event'], []).append(row)
         return True
 
-    def unregister_event_automation(self, name: str) -> bool:
+    def unregister_event_automation(self, name: str, author_id: int = None) -> bool:
         found = False
         for bare, autos in list(self.ev_automations.items()):
-            kept = [a for a in autos if a['name'] != name]
+            kept = [
+                a for a in autos
+                if a['name'] != name or (author_id is not None and a['author_id'] != author_id)
+            ]
             if len(kept) != len(autos):
                 found = True
                 if kept: self.ev_automations[bare] = kept
                 else: del self.ev_automations[bare]
         with Session(self.engine) as session:
             row = session.get(Automation, name)
-            if row:
+            if row and (author_id is None or row.author_id == author_id):
                 session.delete(row)
                 session.commit()
                 found = True
@@ -246,7 +269,7 @@ class CoralBot(discord.Client):
 
     async def on_message(self, message: discord.Message):
 
-        if message.author == self.user or message.author.bot: # let's not allow bots to talk to Coral
+        if message.author == self.user or message.author.bot: # let's not allow bots to talk to Chloride
             return
 
         blocked, reason = moderation.is_blocked(self.engine, message.author.id)
@@ -315,8 +338,14 @@ class CoralBot(discord.Client):
                         ).order_by(Message.created_at.desc())
 
                         messages = session.exec(stmt).all()
-
-                        history = [adapter.validate_json(msg.data) for msg in reversed(messages)]
+                        history = []
+                        for msg in reversed(messages):
+                            try:
+                                history.append(adapter.validate_json(msg.data))
+                            except Exception:
+                                logger.exception("Discarding invalid history row %s", msg.id)
+                                session.delete(msg)
+                        session.commit()
 
                     guild = getattr(channel, 'guild', None)
 

@@ -37,7 +37,7 @@ def extract_large_codeblocks(text: str, size: int = 2000):
         if len(block) <= size:
             return block
         lang = (m.group(1) or '').lower()
-        fd, path = tempfile.mkstemp(suffix=f".{_EXT_BY_LANG.get(lang, 'txt')}", prefix='coral_code_', dir='/tmp')
+        fd, path = tempfile.mkstemp(suffix=f".{_EXT_BY_LANG.get(lang, 'txt')}", prefix='chloride_code_', dir='/tmp')
         with os.fdopen(fd, 'w') as f:
             f.write(m.group(2))
         files.append(path)

@@ -4,7 +4,7 @@ import os
 import typer, logging
 
 from .config import load_config
-from .bot import CoralBot
+from .bot import ChlorideBot
 from .history import init_db
 from .agent import agent
 from .model import build_model
@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 def main():
     log.setup()
 
-    logger.info("Coral is initializing!")
+    logger.info("Chloride is initializing!")
 
     config = load_config()
 
@@ -25,7 +25,7 @@ def main():
 
     intents = discord.Intents.all()
 
-    client = CoralBot(
+    client = ChlorideBot(
         config  = config,
         agent   = agent,
         model   = model,
@@ -38,7 +38,7 @@ def main():
 
     if not token:
         logger.critical("DISCORD_TOKEN not found in config or environment variables. Please set it and rerun the command.")
-        typer.Exit(1)
+        raise typer.Exit(1)
 
     client.run(token)
 

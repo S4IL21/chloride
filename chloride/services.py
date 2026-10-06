@@ -57,6 +57,7 @@ class Service:
                 await asyncio.wait_for(self.process.wait(), timeout=10)
             except asyncio.TimeoutError:
                 self.process.kill()
+                await self.process.wait()
             except ProcessLookupError:
                 pass
 
@@ -112,7 +113,16 @@ class ServiceSupervisor:
         while True:
             await asyncio.sleep(5)
             for svc in list(self.services.values()):
-                if not svc.enabled or svc.crash_looped or svc.process is None:
+                if not svc.enabled or svc.crash_looped:
+                    continue
+
+                if svc.process is None:
+                    svc.lifetimes.append(0)
+                    if len(svc.lifetimes) == CRASH_LOOP_COUNT:
+                        svc.crash_looped = True
+                        logger.warning("Service %s repeatedly failed to start; pausing retries.", svc.name)
+                        continue
+                    await svc.start()
                     continue
 
                 if not svc.is_running():
